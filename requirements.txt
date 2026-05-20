@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+httpx==0.27.0
+opencv-python-headless==4.10.0.84
+zxing-cpp==2.2.0
+numpy==1.26.4
+cryptography==43.0.3
