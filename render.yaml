@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: qr-scanner-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: STORAGE_KEY
+        sync: false
