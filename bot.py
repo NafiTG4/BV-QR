@@ -304,19 +304,78 @@ def _decode(img_bytes: bytes) -> list[tuple[str, str]]:
 # QR code generator
 # ---------------------------------------------------------------------------
 
-def _generate_qr(text: str) -> bytes:
-    """Generate a QR code PNG from text. Returns raw PNG bytes."""
+def _generate_qr(text: str, style: str = "classic") -> bytes:
+    """
+    Generate a styled QR code PNG. Returns raw PNG bytes.
+    Styles: classic | dark | rounded
+    Uses ERROR_CORRECT_H (30% damage tolerance) for all styles.
+    """
+    from PIL import Image, ImageDraw, ImageEnhance
+
+    STYLES: dict[str, dict] = {
+        "classic": {"fill": "#000000", "back": "#FFFFFF", "border_color": "#D1D5DB"},
+        "dark":    {"fill": "#E2E8F0", "back": "#0F172A", "border_color": "#1E293B"},
+        "rounded": {"fill": "#1E293B", "back": "#F1F5F9", "border_color": "#CBD5E1"},
+    }
+    cfg = STYLES.get(style, STYLES["classic"])
+
+    def hex_to_rgb(h: str) -> tuple:
+        h = h.lstrip("#")
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
     qr = qrcode.QRCode(
-        version=None,           # auto-size
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=4,
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=12,
+        border=3,
     )
     qr.add_data(text)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+    qr_img = qr.make_image(fill_color=cfg["fill"], back_color=cfg["back"]).convert("RGBA")
+
+    qr_w, qr_h = qr_img.size
+    pad      = 28
+    label_h  = 44
+    radius   = 22
+    canvas_w = qr_w + pad * 2
+    canvas_h = qr_h + pad * 2 + label_h
+
+    bg_rgb     = hex_to_rgb(cfg["back"])
+    fill_rgb   = hex_to_rgb(cfg["fill"])
+    border_rgb = hex_to_rgb(cfg["border_color"])
+
+    # Card with rounded corners
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw   = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle(
+        [0, 0, canvas_w - 1, canvas_h - 1],
+        radius=radius,
+        fill=bg_rgb + (255,),
+        outline=border_rgb + (255,),
+        width=2,
+    )
+
+    # Paste QR code centered
+    canvas.paste(qr_img, (pad, pad), qr_img)
+
+    # Subtle label at bottom center
+    label_y = qr_h + pad + label_h // 2
+    draw.text(
+        (canvas_w // 2, label_y),
+        "✦ ScanVault",
+        fill=fill_rgb + (90,),   # semi-transparent
+        anchor="mm",
+    )
+
+    # Flatten RGBA onto solid background
+    final = Image.new("RGB", canvas.size, bg_rgb)
+    final.paste(canvas, mask=canvas.split()[3])
+
+    # Sharpen slightly for crisper pixels
+    final = ImageEnhance.Sharpness(final).enhance(1.4)
+
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    final.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 # ---------------------------------------------------------------------------
@@ -595,12 +654,15 @@ def _welcome(name: str, uid: int) -> tuple[str, InlineKeyboardMarkup]:
         f"› Wi\\-Fi · Contacts · Crypto · UPI · Geo\n"
         f"› URLs with phishing check · SMS · Email · Phone\n\n"
         f"*Also*\n"
-        f"› Send any text to generate a QR code\n\n"
+        f"› Tap *Generate QR* to create your own QR code\n\n"
         f"`{DIV}`\n"
         f"_No image is ever saved to disk\\._"
     )
 
-    btns = [[InlineKeyboardButton(priv_label, callback_data="toggle_privacy")]]
+    btns = [
+        [InlineKeyboardButton(priv_label, callback_data="toggle_privacy")],
+        [InlineKeyboardButton("🔲 Generate QR", callback_data="qr_generate")],
+    ]
 
     if not priv:
         # History row: view + filter + export
@@ -684,48 +746,251 @@ async def _send_url(
 # Handlers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# QR category menu builder
+# ---------------------------------------------------------------------------
+
+# Each category stores a user-friendly label and the callback prefix
+QR_CATEGORIES = [
+    ("🔗 URL / Link",     "qrcat:url"),
+    ("📶 Wi-Fi",          "qrcat:wifi"),
+    ("👤 Contact (vCard)","qrcat:vcard"),
+    ("📞 Phone",          "qrcat:tel"),
+    ("✉️ Email",          "qrcat:email"),
+    ("💬 SMS",            "qrcat:sms"),
+    ("📍 Location",       "qrcat:geo"),
+    ("📄 Plain Text",     "qrcat:text"),
+]
+
+def _qr_category_menu() -> tuple[str, InlineKeyboardMarkup]:
+    """Return the 'choose a category' prompt and its keyboard."""
+    text = (
+        f"✦ *Generate QR Code*\n"
+        f"`{DIV}`\n"
+        "_Choose what type of QR code you want to create:_"
+    )
+    rows = []
+    row  = []
+    for label, cb in QR_CATEGORIES:
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="qrcat:cancel")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _qr_style_menu(category: str, data_payload: str) -> tuple[str, InlineKeyboardMarkup]:
+    """After data is entered, offer style selection before generating."""
+    text = (
+        f"🎨 *Choose a Style*\n"
+        f"`{DIV}`\n"
+        f"_Data saved — pick a theme for your QR code:_"
+    )
+    rows = [
+        [
+            InlineKeyboardButton("⬜ Classic",  callback_data=f"qrgen:{category}:classic:{data_payload}"),
+            InlineKeyboardButton("⬛ Dark",     callback_data=f"qrgen:{category}:dark:{data_payload}"),
+            InlineKeyboardButton("🩶 Minimal",  callback_data=f"qrgen:{category}:rounded:{data_payload}"),
+        ],
+        [InlineKeyboardButton("✖ Cancel", callback_data="qrcat:cancel")],
+    ]
+    return text, InlineKeyboardMarkup(rows)
+
+
+# Per-user pending QR state: uid -> {"step": str, "category": str, "fields": dict}
+QR_PENDING: dict[int, dict] = {}
+
+# Category-specific prompts and field names
+QR_STEPS: dict[str, list[tuple[str, str]]] = {
+    # (field_key, prompt_text)
+    "url":   [("url",     "🔗 Send me the URL\\.\nExample: `https://example\\.com`")],
+    "text":  [("text",    "📄 Send me the text you want to encode\\.")],
+    "tel":   [("tel",     "📞 Send me the phone number\\.\nExample: `\\+8801XXXXXXXXX`")],
+    "email": [("to",      "✉️ Send me the email address\\."),
+              ("subject", "📝 Send the subject line \\(or type `skip`\\)\\.")],
+    "sms":   [("tel",     "📞 Send me the recipient phone number\\."),
+              ("msg",     "💬 Send the message text \\(or type `skip`\\)\\.")],
+    "geo":   [("lat",     "📍 Send the *latitude*\\.\nExample: `23\\.8103`"),
+              ("lon",     "📍 Now send the *longitude*\\.\nExample: `90\\.4125`")],
+    "wifi":  [("ssid",    "📶 Send the *Wi\\-Fi network name* \\(SSID\\)\\."),
+              ("pwd",     "🔑 Send the *password* \\(or type `skip` for open network\\)\\."),
+              ("enc",     "🔒 Send the *security type*: `WPA`, `WEP`, or `nopass`\\.")],
+    "vcard": [("name",    "👤 Send the *full name*\\."),
+              ("phone",   "📞 Send the *phone number* \\(or `skip`\\)\\."),
+              ("email",   "✉️ Send the *email address* \\(or `skip`\\)\\."),
+              ("org",     "🏢 Send the *company/org name* \\(or `skip`\\)\\.")],
+}
+
+
+def _build_qr_payload(category: str, fields: dict) -> str:
+    """Assemble the raw QR data string from collected fields."""
+    if category == "url":
+        url = fields.get("url", "")
+        if not re.match(r"^https?://", url, re.I):
+            url = "https://" + url
+        return url
+    if category == "text":
+        return fields.get("text", "")
+    if category == "tel":
+        return f"tel:{fields.get('tel', '')}"
+    if category == "email":
+        addr = fields.get("to", "")
+        subj = fields.get("subject", "")
+        return f"mailto:{addr}?subject={urllib.parse.quote(subj)}" if subj else f"mailto:{addr}"
+    if category == "sms":
+        tel = fields.get("tel", "")
+        msg = fields.get("msg", "")
+        return f"smsto:{tel}:{msg}" if msg else f"sms:{tel}"
+    if category == "geo":
+        return f"geo:{fields.get('lat', '0')},{fields.get('lon', '0')}"
+    if category == "wifi":
+        ssid = fields.get("ssid", "")
+        pwd  = fields.get("pwd", "")
+        enc  = fields.get("enc", "WPA").upper()
+        if enc == "NOPASS":
+            enc = "nopass"
+            pwd = ""
+        return f"WIFI:T:{enc};S:{ssid};P:{pwd};;"
+    if category == "vcard":
+        name  = fields.get("name", "")
+        phone = fields.get("phone", "")
+        email = fields.get("email", "")
+        org   = fields.get("org", "")
+        lines = ["BEGIN:VCARD", "VERSION:3.0", f"FN:{name}"]
+        if phone: lines.append(f"TEL:{phone}")
+        if email: lines.append(f"EMAIL:{email}")
+        if org:   lines.append(f"ORG:{org}")
+        lines.append("END:VCARD")
+        return "\n".join(lines)
+    return ""
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+def _is_private(update: Update) -> bool:
+    """Return True only if the message comes from a private chat."""
+    return update.effective_chat.type == "private"
+
+
 async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command and plain text — show welcome or generate QR."""
+    """Handle /start command and all plain text — only in private chats."""
+    if not _is_private(update):
+        return   # silently ignore group messages
+
     user = update.effective_user
     uid  = user.id
     _touch_active(uid)
 
-    msg = update.message.text or ""
+    msg = (update.message.text or "").strip()
 
-    # If user sends non-command text, generate a QR code from it
-    if msg and not msg.startswith("/"):
-        await handle_qr_generate(update, msg)
+    # If user is mid QR-build flow, route text to the collector
+    if uid in QR_PENDING and not msg.startswith("/"):
+        await _handle_qr_step(update, uid, msg)
         return
 
-    name      = user.first_name or "there"
-    text, kb  = _welcome(name, uid)
+    # Any plain (non-command) text now shows welcome, NOT auto-generate
+    name     = user.first_name or "there"
+    text, kb = _welcome(name, uid)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
 
 
-async def handle_qr_generate(update: Update, text: str) -> None:
-    """Generate and send a QR code image for the given text."""
-    status = await update.message.reply_text(
-        "⚙️ _Generating QR code\\.\\.\\._", parse_mode=ParseMode.MARKDOWN_V2
-    )
+async def _handle_qr_step(update: Update, uid: int, msg: str) -> None:
+    """Collect the next field for the active QR build flow."""
+    state    = QR_PENDING[uid]
+    category = state["category"]
+    steps    = QR_STEPS[category]
+    fields   = state["fields"]
+
+    # Which step are we on?
+    filled = len(fields)
+    if filled >= len(steps):
+        return   # shouldn't happen
+
+    field_key, _ = steps[filled]
+    value = "" if msg.lower() == "skip" else msg
+    fields[field_key] = value
+
+    # Check if more steps remain
+    next_filled = len(fields)
+    if next_filled < len(steps):
+        _, next_prompt = steps[next_filled]
+        await update.message.reply_text(
+            next_prompt, parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    # All fields collected — offer style selection
+    # Encode payload into callback_data (truncated to 60 chars for Telegram 64-byte limit)
+    raw_payload = _build_qr_payload(category, fields)
+    # Store payload in state instead of callback_data (avoids 64-byte limit)
+    state["payload"] = raw_payload
+    del QR_PENDING[uid]                 # clear pending state
+    QR_PENDING[uid] = {"payload": raw_payload, "category": category}  # keep for style step
+
+    text, kb = _qr_style_menu(category, "STORED")
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+
+
+async def _do_generate_qr(
+    update: Update,
+    uid: int,
+    raw_payload: str,
+    style: str,
+    edit_msg=None,
+) -> None:
+    """Generate the QR image and send it. Optionally edits a status message."""
+    status_text = "⚙️ _Generating QR code\\.\\.\\._"
+    if edit_msg:
+        try:
+            await edit_msg.edit_text(status_text, parse_mode=ParseMode.MARKDOWN_V2)
+        except Exception:
+            pass
+        send_target = edit_msg
+    else:
+        send_target = await update.message.reply_text(
+            status_text, parse_mode=ParseMode.MARKDOWN_V2
+        )
+
     try:
-        png = await asyncio.get_event_loop().run_in_executor(None, _generate_qr, text)
-        caption = f"✅ *QR Code generated*\n`{DIV}`\n_Data:_ {_e(text[:100])}"
-        await update.message.reply_photo(
+        gen_fn = lambda: _generate_qr(raw_payload, style)
+        png    = await asyncio.get_event_loop().run_in_executor(None, gen_fn)
+
+        preview = raw_payload[:80].replace("\n", " ")
+        caption = (
+            f"✅ *QR Code Ready*\n"
+            f"`{DIV}`\n"
+            f"*Style* ›  `{_e(style.capitalize())}`\n"
+            f"*Data* ›  {_e(preview)}"
+        )
+        await update.effective_chat.send_photo(
             photo=io.BytesIO(png),
             caption=caption,
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-        await status.delete()
+        try:
+            await send_target.delete()
+        except Exception:
+            pass
     except Exception as ex:
         logger.error("QR generate error: %s", ex)
-        await status.edit_text(
-            "❌ *Could not generate QR code\\.*",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        try:
+            await send_target.edit_text(
+                "❌ *Could not generate QR code\\.*",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception:
+            pass
 
 
 async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photo / document image uploads — decode all barcodes found."""
+    """Handle photo / document image uploads — only in private chats."""
+    if not _is_private(update):
+        return   # silently ignore group messages
+
     uid = update.effective_user.id
     _touch_active(uid)
 
@@ -763,7 +1028,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not codes:
         await status.edit_text(
-            "🔍 *Nothing found*\n"
+            f"🔍 *Nothing found*\n"
             f"`{DIV}`\n"
             "No QR code or barcode was detected\\.\n\n"
             "*Tips*\n"
@@ -789,7 +1054,9 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if idx == 1:
                 await status.edit_text(full, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
             else:
-                await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+                await update.message.reply_text(
+                    full, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb
+                )
 
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -800,6 +1067,54 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await q.answer()
 
     data = q.data or ""
+
+    # ── QR Generate: show category menu ─────────────────────────────────────
+    if data == "qr_generate":
+        text, kb = _qr_category_menu()
+        await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+        return
+
+    # ── QR category selected: start multi-step data collection ──────────────
+    if data.startswith("qrcat:"):
+        cat = data.split(":", 1)[1]
+        if cat == "cancel":
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            return
+        steps = QR_STEPS.get(cat, [])
+        if not steps:
+            return
+        # Initialize pending state for this user
+        QR_PENDING[uid] = {"category": cat, "fields": {}, "step": 0}
+        _, first_prompt = steps[0]
+        await q.message.reply_text(
+            f"✦ *QR Builder*\n`{DIV}`\n{first_prompt}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    # ── QR style selected: retrieve stored payload and generate ─────────────
+    if data.startswith("qrgen:"):
+        # Format: qrgen:{category}:{style}:STORED
+        parts = data.split(":", 3)
+        if len(parts) < 3:
+            return
+        style = parts[2]   # classic | dark | rounded
+        # Retrieve payload stored in QR_PENDING
+        pending = QR_PENDING.get(uid, {})
+        raw_payload = pending.get("payload", "")
+        if uid in QR_PENDING:
+            del QR_PENDING[uid]
+        if not raw_payload:
+            await q.message.reply_text(
+                "❌ *Session expired\\.*\n_Please start over\\._",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        await _do_generate_qr(update, uid, raw_payload, style, edit_msg=q.message)
+        return
 
     # ── Toggle privacy ───────────────────────────────────────────────────────
     if data == "toggle_privacy":
@@ -964,13 +1279,16 @@ async def _ttl_cleanup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # /start + plain text (QR generate or welcome)
-    app.add_handler(MessageHandler(filters.COMMAND | filters.TEXT, handle_start))
+    # All handlers restricted to private chats only — bot ignores groups silently
+    private = filters.ChatType.PRIVATE
+
+    # /start + plain text
+    app.add_handler(MessageHandler(private & (filters.COMMAND | filters.TEXT), handle_start))
 
     # Photo and document (original quality) image uploads
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_image))
+    app.add_handler(MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), handle_image))
 
-    # All inline button callbacks
+    # All inline button callbacks (always private since buttons come from private chat)
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     # Hourly idle-user cleanup to prevent memory leak
