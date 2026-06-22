@@ -10,6 +10,7 @@ ScanVault — Telegram QR & Barcode Scanner Bot
 - Rate limiting, multi-code detection, no disk writes
 """
 
+import asyncio
 import io
 import json
 import logging
@@ -185,9 +186,25 @@ async def _title(url: str) -> str:
 
 def _phishing(url: str) -> bool:
     host = urllib.parse.urlparse(url).netloc.lower()
+    # Bare IP address
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}(:\d+)?$", host):
         return True
-    return any(host.endswith(t) for t in SUSPICIOUS_TLDS)
+    # Suspicious free TLDs
+    if any(host.endswith(t) for t in SUSPICIOUS_TLDS):
+        return True
+    # Homoglyph / typosquatting: digits substituted for letters in popular brands
+    domain_part = host.split(":")[0]  # strip port
+    squatted = re.sub(r"[0@]", "o", re.sub(r"1|!", "l", domain_part))
+    POPULAR = {"paypal", "google", "facebook", "amazon", "apple", "microsoft",
+               "netflix", "instagram", "whatsapp", "telegram", "twitter", "x"}
+    for brand in POPULAR:
+        if brand in squatted and not domain_part.endswith(f"{brand}.com"):
+            return True
+    # Excessive subdomains (e.g. paypal.com.evil.xyz)
+    parts = domain_part.split(".")
+    if len(parts) > 4:
+        return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Image decoder
@@ -249,11 +266,6 @@ def _parse(raw: str) -> tuple[str, list[list[InlineKeyboardButton]], str]:
 
 
 def _p_wifi(r: str) -> tuple[str, list, str]:
-    ssid = (re.search(r"S:([^;]*)", r) or type("", (), {"group": lambda s, n: "?"})()).group(1)
-    pwd  = (re.search(r"P:([^;]*)", r) or type("", (), {"group": lambda s, n: ""})()).group(1)
-    enc  = (re.search(r"T:([^;]*)", r) or type("", (), {"group": lambda s, n: "?"})()).group(1)
-
-    # Robust extraction
     m = re.search(r"S:([^;]*)", r); ssid = m.group(1) if m else "?"
     m = re.search(r"P:([^;]*)", r); pwd  = m.group(1) if m else ""
     m = re.search(r"T:([^;]*)", r); enc  = m.group(1) if m else "?"
@@ -395,7 +407,9 @@ def _p_tel(r: str) -> tuple[str, list, str]:
 
 def _p_text(r: str) -> tuple[str, list, str]:
     preview = r[:500]
-    text = f"📄 *Scanned Data*\n`{DIV}`\n`{_e(preview)}`"
+    # Use blockquote-style (no backtick wrapping) to avoid MarkdownV2 parse errors
+    # when raw data contains backticks or other special characters
+    text = f"📄 *Scanned Data*\n`{DIV}`\n{_e(preview)}"
     return text, [], "text"
 
 # ---------------------------------------------------------------------------
@@ -426,7 +440,10 @@ def _welcome(name: str, uid: int) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(priv_label,       callback_data="toggle_privacy"),
         ],
         [
-            InlineKeyboardButton(f"📋 History  ({count})", callback_data="show_history"),
+            InlineKeyboardButton(
+                f"📋 History  ({count} scan{'s' if count != 1 else ''})",
+                callback_data="show_history",
+            ),
             InlineKeyboardButton("🗑 Clear",               callback_data="clear_history"),
         ],
     ]
@@ -441,15 +458,22 @@ async def _send_url(
     edit_msg,
     raw: str,
     prefix: str,
+    uid: int,
 ) -> None:
-    final    = raw
-    expanded = await _expand(raw)
-    if expanded:
-        final = expanded
+    # Run expand and title fetch concurrently — they are independent
+    expanded, page_title = await asyncio.gather(
+        _expand(raw),
+        _title(raw),
+        return_exceptions=False,
+    )
 
-    page_title = await _title(final)
-    risky      = _phishing(final)
-    domain     = urllib.parse.urlparse(final).netloc or final[:50]
+    final  = expanded if expanded else raw
+    risky  = _phishing(final)
+    domain = urllib.parse.urlparse(final).netloc or final[:50]
+
+    # Fetch title for the expanded URL if we got a redirect and title was empty
+    if expanded and not page_title:
+        page_title = await _title(final)
 
     lines = [f"{prefix}🔗 *Link*\n`{DIV}`"]
     lines.append(f"`{_e(raw[:200])}`")
@@ -469,10 +493,25 @@ async def _send_url(
     btns = [[InlineKeyboardButton("🌐 Open Link", url=final)]]
     kb   = InlineKeyboardMarkup(btns)
 
-    if edit_msg:
-        await edit_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-    else:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+    # Save URL to history now that we have all enriched data
+    _save(uid, "url", raw)
+
+    try:
+        if edit_msg:
+            await edit_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+        else:
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+    except Exception as ex:
+        logger.error("_send_url edit/reply failed: %s", ex)
+        # Fallback: plain text so "Scanning..." doesn't get stuck
+        try:
+            fallback = f"🔗 Link: {raw[:200]}"
+            if edit_msg:
+                await edit_msg.edit_text(fallback)
+            else:
+                await update.message.reply_text(fallback)
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Handlers
@@ -537,11 +576,12 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for idx, raw in enumerate(codes, 1):
         prefix = f"*\\[{idx} / {total}\\]*  " if total > 1 else ""
         text, btns, kind = _parse(raw)
-        _save(uid, kind, raw)
 
         if kind == "url":
-            await _send_url(update, status if idx == 1 else None, raw, prefix)
+            # _send_url handles both history save and error fallback internally
+            await _send_url(update, status if idx == 1 else None, raw, prefix, uid)
         else:
+            _save(uid, kind, raw)
             full = prefix + text if prefix else text
             kb   = InlineKeyboardMarkup(btns) if btns else None
             if idx == 1:
